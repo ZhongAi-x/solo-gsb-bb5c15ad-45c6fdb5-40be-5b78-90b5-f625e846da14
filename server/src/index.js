@@ -3,12 +3,12 @@
 const path = require('path');
 const fs = require('fs');
 const express = require('express');
-const { cutBoards, recutBoards, cancelPreviewBoards, UserError } = require('./cutting');
+const { cutBoards, recutBoards, cancelPreviewBoards, batchPreviewBoards, UserError } = require('./cutting');
 
 const app = express();
 const PORT = Number(process.env.PORT) || 8080;
 
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '2mb' }));
 
 // 健康检查（供 compose healthcheck 使用）
 app.get('/api/health', (_req, res) => {
@@ -53,6 +53,20 @@ app.post('/api/cancel-preview', (req, res) => {
       return res.status(err.statusCode).json({ ok: false, error: err.message });
     }
     console.error('撤单预览计算失败：', err);
+    res.status(500).json({ ok: false, error: '服务器内部错误' });
+  }
+});
+
+// 连续批次用料预演：按批次保存顺序逐批排料，余板跨批结转（只读预演，不改表单与单次方案）
+app.post('/api/batch-preview', (req, res) => {
+  try {
+    const result = batchPreviewBoards(req.body);
+    res.json({ ok: true, result });
+  } catch (err) {
+    if (err instanceof UserError) {
+      return res.status(err.statusCode).json({ ok: false, error: err.message });
+    }
+    console.error('连续批次预演计算失败：', err);
     res.status(500).json({ ok: false, error: '服务器内部错误' });
   }
 });

@@ -83,6 +83,11 @@ export default function App() {
   const [offcutSelected, setOffcutSelected] = useState(new Set());
   const [addedOffcuts, setAddedOffcuts] = useState(new Set());
   const [appendedStockIds, setAppendedStockIds] = useState(new Set());
+  // 连续批次用料预演：已保存批次（表单快照，保存后改表单不影响）、预演结果与状态
+  const [batches, setBatches] = useState([]);
+  const [batchPreview, setBatchPreview] = useState(null);
+  const [batchError, setBatchError] = useState('');
+  const [batchLoading, setBatchLoading] = useState(false);
 
   // ---- 订单 / 零件行编辑 ----
   const updateOrder = (oi, key, value) => {
@@ -149,6 +154,9 @@ export default function App() {
     resetRecut();
     resetCancel();
     resetOffcuts();
+    setBatches([]);
+    setBatchPreview(null);
+    setBatchError('');
   };
 
   // 组装请求载荷并校验余板行：全空行忽略；非空行必须编号唯一且长 / 宽为正数
@@ -376,11 +384,72 @@ export default function App() {
     });
   };
 
+  // ---- 连续批次用料预演 ----
+  // 保存当前表单为一个批次：深拷贝当前载荷作为快照，之后修改表单不影响已保存批次
+  const saveBatch = () => {
+    setBatchError('');
+    if (!validateMaxCut(maxCutLength)) {
+      setBatchError('设备最大单刀长度必须为正数（留空则不限制）');
+      return;
+    }
+    if (!validateMinOffcut(minOffcutLength) || !validateMinOffcut(minOffcutWidth)) {
+      setBatchError('余料回收最小长度 / 最小宽度必须是非负数字（留空则不筛选）');
+      return;
+    }
+    const { payload, error: stockError } = buildPayload();
+    if (stockError) {
+      setBatchError(stockError);
+      return;
+    }
+    if (batches.length >= 20) {
+      setBatchError('连续批次最多 20 批');
+      return;
+    }
+    setBatches((prev) => [...prev, JSON.parse(JSON.stringify(payload))]);
+    setBatchPreview(null); // 批次清单变化后，旧预演失效
+  };
+
+  const removeBatch = (bi) => {
+    setBatches((prev) => prev.filter((_, idx) => idx !== bi));
+    setBatchPreview(null);
+  };
+
+  const clearBatches = () => {
+    setBatches([]);
+    setBatchPreview(null);
+    setBatchError('');
+  };
+
+  const submitBatchPreview = async () => {
+    if (batches.length === 0) return;
+    setBatchError('');
+    setBatchPreview(null);
+    setBatchLoading(true);
+    try {
+      const res = await fetch('/api/batch-preview', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        // 按保存顺序提交整批快照；后端只读计算，不改表单与单次排料结果
+        body: JSON.stringify({ batches }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        setBatchError(data.error || '连续批次预演失败，请检查各批输入');
+      } else {
+        setBatchPreview(data.result);
+      }
+    } catch (err) {
+      setBatchError('无法连接排料服务，请确认后端已启动');
+    } finally {
+      setBatchLoading(false);
+    }
+  };
+
   return (
     <div className="page">
       <header className="site-header">
         <h1>矩形板材下料 · 多订单拼版断头切割排料</h1>
-        <p>多张订单混合拼版：按订单与零件行顺序断头切割，可登记带唯一编号的临时余板库存（已开板放不下时先用余板、最后开标准新板），结果保留订单归属，按单取件并分摊材料费；方案生成后自动列出可回收余料清单，可勾选一键追加回余板库存；损坏件可勾选后生成独立补切方案；还可按订单预览撤单前后影响（原方案与表单不变）</p>
+        <p>多张订单混合拼版：按订单与零件行顺序断头切割，可登记带唯一编号的临时余板库存（已开板放不下时先用余板、最后开标准新板），结果保留订单归属，按单取件并分摊材料费；方案生成后自动列出可回收余料清单，可勾选一键追加回余板库存；损坏件可勾选后生成独立补切方案；还可按订单预览撤单前后影响（原方案与表单不变）；左下角可把当前表单依次保存为多批，进行连续批次用料预演（首批余板作初始库存、余料跨批回收，逐批展示新开板数与累计材料费）</p>
       </header>
 
       <main className="layout">
@@ -542,6 +611,17 @@ export default function App() {
               {loading ? '正在排料…' : '生成多订单裁切方案'}
             </button>
           </form>
+
+          <BatchPreviewSection
+            batches={batches}
+            preview={batchPreview}
+            error={batchError}
+            loading={batchLoading}
+            onSave={saveBatch}
+            onRemove={removeBatch}
+            onClear={clearBatches}
+            onSubmit={submitBatchPreview}
+          />
         </section>
 
         <section className="panel result-panel">
@@ -564,6 +644,7 @@ export default function App() {
                 <li>在分单取件清单勾选损坏件，可生成独立的缺件补切方案（补切只开标准新板，不耗用余板）</li>
                 <li>方案生成后自动给出可回收余料清单（按可配置的最小长 / 宽筛选），可勾选一键追加为临时余板库存</li>
                 <li>选择一张订单即可预览撤单影响：按生成方案时的输入快照对比撤单前后用板与材料费，原方案不变</li>
+                <li>左下角「连续批次用料预演」：把当前表单依次保存为多批快照，首批表单余板作为初始库存；按保存顺序逐批排料，每批扣除已用余板、回收符合尺寸的余料入池（第n批-原编号），逐批展示新开标准板数、已用 / 新增余板、批末库存与累计材料费；某批无法加工时指出批次并停止，不改动表单与单次排料结果</li>
               </ul>
             </div>
           )}
@@ -1258,6 +1339,232 @@ function CancelPreviewResult({ preview }) {
           </tr>
         </tbody>
       </table>
+    </div>
+  );
+}
+
+/**
+ * 连续批次用料预演区块（左侧表单内）：
+ *  - 「存入下一批」把当前表单深拷贝为批次快照，保存后再改表单不影响已存批次；
+ *  - 首批表单的临时余板库存作为初始余板池，后续批次自带库存忽略；
+ *  - 按保存顺序提交后端逐批排料：每批扣除已用余板、回收本批符合尺寸的余料入池；
+ *  - 只读预演，不改动表单与单次排料结果；某批无法加工时后端指出批次号并整体停止。
+ */
+function BatchPreviewSection({ batches, preview, error, loading, onSave, onRemove, onClear, onSubmit }) {
+  return (
+    <div className="batch-section">
+      <h2>连续批次用料预演（{batches.length}）</h2>
+      <p className="hint">
+        调整好当前表单（原板 / 板材参数、订单清单）后点「存入下一批」，可依次保存多批。
+        <b>每批保存的是当时表单快照</b>，保存后再修改表单不影响已保存批次。
+        <b>首批表单中的临时余板库存作为初始余板池</b>（后续批次表单里的余板库存不参与）；
+        预演按保存顺序逐批调用同一套排料规则：每批从余板池扣除已用编号、保留未用余板，
+        再把本批符合回收尺寸的余料以「第n批-原余料编号」入池供后续批次使用，跨批编号不冲突。
+        预演只读，<b>不改动表单与单次排料结果</b>。
+      </p>
+      <div className="batch-controls">
+        <button type="button" className="btn ghost" onClick={onSave} disabled={batches.length >= 20}>
+          ＋ 存入下一批（当前表单）
+        </button>
+        <button type="button" className="btn primary" onClick={onSubmit}
+          disabled={batches.length === 0 || loading}>
+          {loading ? '正在逐批预演…' : `开始连续批次预演（${batches.length} 批）`}
+        </button>
+        {batches.length > 0 && (
+          <button type="button" className="btn" onClick={onClear} disabled={loading}>清空批次</button>
+        )}
+      </div>
+
+      {batches.length > 0 && (
+        <ol className="batch-queue">
+          {batches.map((b, i) => (
+            <li key={i} className="batch-queue-item">
+              <span className="order-badge">{i + 1}</span>
+              <span className="batch-queue-meta">
+                原板 {strip(b.boardWidth)} × {strip(b.boardHeight)}
+                {b.kerf ? ` · 锯缝 ${strip(b.kerf)}` : ''}
+                {b.boardPrice ? ` · ¥${strip(b.boardPrice)}/张` : ''}
+                {b.maxCutLength != null ? ` · 单刀≤${strip(b.maxCutLength)}` : ''}
+                {' · '}{(b.orders || []).map((o) => o.orderNo || `订单${(b.orders || []).indexOf(o) + 1}`).join('、')}
+                {i === 0 && b.stockBoards && b.stockBoards.length > 0 && (
+                  <span className="stock-tag new">初始余板 {b.stockBoards.length} 块</span>
+                )}
+              </span>
+              <button type="button" className="btn icon op-col" title="删除该批次"
+                onClick={() => onRemove(i)}>✕</button>
+            </li>
+          ))}
+        </ol>
+      )}
+
+      {error && (
+        <div className="alert" role="alert">
+          <strong>无法预演：</strong>{error}
+        </div>
+      )}
+
+      {preview && <BatchPreviewResult preview={preview} />}
+    </div>
+  );
+}
+
+function BatchPreviewResult({ preview }) {
+  const last = preview.batches[preview.batches.length - 1];
+  return (
+    <div className="batch-result">
+      <p className="hint batch-summary-line">
+        共 {preview.batchCount} 批：累计新开标准板 <b>{last ? preview.batches.reduce((s, b) => s + b.standardBoardsCount, 0) : 0}</b> 张，
+        批末余板池 <b>{last ? last.poolAfter.length : 0}</b> 块，
+        累计材料费 <b>¥{yuan(last ? last.cumulativeMaterialCents : 0)}</b>。
+      </p>
+      {preview.batches.map((b) => <BatchCard key={b.batch} b={b} />)}
+    </div>
+  );
+}
+
+function BatchCard({ b }) {
+  const originText = (origin) => (
+    origin.kind === 'initial'
+      ? '首批初始库存'
+      : `第 ${origin.batch} 批回收（${origin.offcutId}）`
+  );
+  return (
+    <div className="batch-card">
+      <h3>
+        第 {b.batch} 批
+        <span className="board-kind standard">
+          {strip(b.params.boardWidth)} × {strip(b.params.boardHeight)}
+          {b.params.kerf ? ` · 锯缝 ${strip(b.params.kerf)}` : ''}
+          {b.params.boardPrice ? ` · ¥${strip(b.params.boardPrice)}/张` : ''}
+          {b.params.maxCutLength != null ? ` · 单刀≤${strip(b.params.maxCutLength)}` : ''}
+        </span>
+        <span className="board-price">批末库存 {b.poolAfter.length} 块</span>
+      </h3>
+      <p className="hint">订单：{b.orders.join('、')}；共 {b.totalParts} 件</p>
+      <div className="stat-grid">
+        <div className="stat accent"><b>{b.standardBoardsCount}</b><span>本批新开标准板（用板 {b.boardsCount} 张）</span></div>
+        <div className="stat"><b>{b.stockUsed.length}</b><span>本批已用余板</span></div>
+        <div className="stat"><b>{b.stockAdded.length}</b><span>本批新增回收余板</span></div>
+        <div className="stat"><b>{b.poolAfter.length}</b><span>批末余板库存（块）</span></div>
+        <div className="stat"><b>¥{yuan(b.materialCents)}</b><span>本批材料费</span></div>
+        <div className="stat accent"><b>¥{yuan(b.cumulativeMaterialCents)}</b><span>累计材料费</span></div>
+      </div>
+
+      {b.stockUsed.length > 0 && (
+        <>
+          <h4 className="batch-subtitle">本批已用余板（已从池中扣除）</h4>
+          <table className="detail-table">
+            <thead>
+              <tr><th>余板编号</th><th>来源</th><th>尺寸 长×宽</th><th>批初池序号</th><th>本批板号</th></tr>
+            </thead>
+            <tbody>
+              {b.stockUsed.map((s) => (
+                <tr key={s.id}>
+                  <td>{s.id}</td>
+                  <td>{originText(s.origin)}</td>
+                  <td>{strip(s.width)} × {strip(s.height)}</td>
+                  <td>{s.poolIndex != null ? `第 ${s.poolIndex} 块` : '—'}</td>
+                  <td><span className="board-num">{s.board}</span></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </>
+      )}
+
+      {b.stockAdded.length > 0 && (
+        <>
+          <h4 className="batch-subtitle">本批新增回收余板（已入池供后续批次）</h4>
+          <table className="detail-table">
+            <thead>
+              <tr><th>池编号</th><th>原余料编号</th><th>来源板号</th><th>尺寸 长×宽</th><th>面积</th></tr>
+            </thead>
+            <tbody>
+              {b.stockAdded.map((s) => (
+                <tr key={s.id}>
+                  <td>{s.id}</td>
+                  <td>{s.offcutId}</td>
+                  <td><span className="board-num">{s.board}</span></td>
+                  <td>{strip(s.width)} × {strip(s.height)}</td>
+                  <td>{fmt(s.area)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </>
+      )}
+
+      <h4 className="batch-subtitle">批末余板库存（{b.poolAfter.length} 块）</h4>
+      {b.poolAfter.length === 0 ? (
+        <p className="hint">批末余板池为空。</p>
+      ) : (
+        <table className="detail-table">
+          <thead>
+            <tr><th>池序号</th><th>余板编号</th><th>来源</th><th>尺寸 长×宽</th></tr>
+          </thead>
+          <tbody>
+            {b.poolAfter.map((s) => (
+              <tr key={s.id}>
+                <td>{s.index}</td>
+                <td>{s.id}</td>
+                <td>{originText(s.origin)}</td>
+                <td>{strip(s.width)} × {strip(s.height)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+
+      <details>
+        <summary>查看本批订单材料费汇总与逐板排料明细（{b.result.boardsCount} 张板）</summary>
+        <table className="detail-table">
+          <thead>
+            <tr><th>订单号</th><th>零件数</th><th>零件面积</th><th>所在板号</th><th>材料费（元）</th></tr>
+          </thead>
+          <tbody>
+            {b.result.orders.map((o) => (
+              <tr key={o.order}>
+                <td>{o.order}</td>
+                <td>{o.partsCount}</td>
+                <td>{fmt(o.partsArea)}</td>
+                <td>{o.boardIndices.join('、')}</td>
+                <td>¥{yuan(o.materialCents)}</td>
+              </tr>
+            ))}
+            <tr className="sum-row">
+              <td>合计</td>
+              <td>{b.totalParts}</td>
+              <td>{fmt(b.result.partsArea)}</td>
+              <td>{b.boardsCount} 张板（余板 {b.stockUsed.length} · 新板 {b.standardBoardsCount}）</td>
+              <td>¥{yuan(b.materialCents)}</td>
+            </tr>
+          </tbody>
+        </table>
+        {b.result.boards.map((brd) => (
+          <div className={`board-card ${brd.kind === 'stock' ? 'stock-board' : 'recut-board'}`} key={brd.index}>
+            <h3>
+              本批第 {brd.index} 张板 / 共 {b.boardsCount} 张
+              {brd.kind === 'stock' ? (
+                <span className="board-kind stock">余板 {brd.stockId}（{strip(brd.width)} × {strip(brd.height)}，不计材料费）</span>
+              ) : (
+                <span className="board-kind standard">新增标准板（{strip(brd.width)} × {strip(brd.height)}）</span>
+              )}
+              {brd.kind === 'standard' && <span className="board-price">板价 ¥{yuan(brd.cost.priceCents)}</span>}
+            </h3>
+            <BoardDiagram board={brd} boardWidth={brd.width} boardHeight={brd.height} />
+            <div className="board-stats">
+              <span>零件 {fmt(brd.partsArea)}</span>
+              <span>锯缝 {fmt(brd.kerfArea)}</span>
+              <span>余料 {fmt(brd.remainderArea)}</span>
+              <span>利用率 {brd.utilization}%</span>
+              <span>{brd.cuts.length} 刀</span>
+              {b.params.maxCutLength != null && (
+                <span className="cut-limit">实际最长刀 {strip(brd.longestCut)} / 上限 {strip(b.params.maxCutLength)}</span>
+              )}
+            </div>
+          </div>
+        ))}
+      </details>
     </div>
   );
 }
