@@ -1,7 +1,7 @@
 /* 排料算法自检：面积守恒、刀路几何、多板、旋转与报错路径 */
 'use strict';
 const assert = require('assert');
-const { cutBoards, recutBoards, cancelPreviewBoards, UserError } = require('./src/cutting');
+const { cutBoards, recutBoards, cancelPreviewBoards, batchPreviewBoards, UserError } = require('./src/cutting');
 
 // 1) 示例数据：面积守恒 + 基本字段
 const r = cutBoards({
@@ -820,5 +820,151 @@ for (const b of ocStock.boards) {
 const rcOc = recutBoards({ ...ocBase, damaged: [{ order: 'A', part: '板', index: 1 }] });
 assert.deepStrictEqual(rcOc.original.offcuts, oc.offcuts);
 assert.deepStrictEqual(rcOc.original.boards, oc.boards);
+
+// 42) 连续批次用料预演：首批表单余板为初始库存，余板池跨批流转，余料按批回收入池
+//     批1：余板 S1（700×500，放 1 件）+ 标准新板 1 张（4 件）；S2 未用保留；
+//          余料 B1-R1（100×500，旋转后满足 500×100）与 B1-R2（600×100）入池 → P1-B1-R1、P1-B1-R2
+//     批2：550×90 放不进 S2 / P1-B1-R1，恰好放进回收余板 P1-B1-R2（600×100）→ 0 张新板
+const bp = batchPreviewBoards({
+  batches: [
+    {
+      boardWidth: 1200, boardHeight: 800, kerf: 0, boardPrice: 100,
+      minOffcutLength: 500, minOffcutWidth: 100,
+      stockBoards: [
+        { id: 'S1', width: 700, height: 500 },
+        { id: 'S2', width: 300, height: 300 },
+      ],
+      orders: [{ orderNo: 'A', parts: [{ name: '块', width: 600, height: 400, quantity: 5 }] }],
+    },
+    {
+      boardWidth: 1200, boardHeight: 800, kerf: 0, boardPrice: 100,
+      minOffcutLength: 500, minOffcutWidth: 100,
+      stockBoards: [{ id: 'X9', width: 2000, height: 2000 }], // 非首批自带余板：不入池
+      orders: [{ orderNo: 'B', parts: [{ name: '条', width: 550, height: 90, quantity: 1 }] }],
+    },
+  ],
+});
+assert.strictEqual(bp.batchesCount, 2);
+const [bp1, bp2] = bp.batches;
+// 批1：1 张新开标准板、材料费 100 元、累计 100 元
+assert.strictEqual(bp1.batch, 1);
+assert.strictEqual(bp1.standardBoardsCount, 1);
+assert.strictEqual(bp1.materialCents, 10000);
+assert.strictEqual(bp1.cumulativeMaterialCents, 10000);
+assert.strictEqual(bp1.poolBeforeCount, 2);
+assert.deepStrictEqual(bp1.stockUsed.map((s) => s.id), ['S1']);
+assert.deepStrictEqual(bp1.stockAdded.map((s) => s.id), ['P1-B1-R1', 'P1-B1-R2']);
+assert.deepStrictEqual(bp1.stockAdded.map((s) => [s.width, s.height]), [[100, 500], [600, 100]]);
+assert.deepStrictEqual(bp1.stockAdded.map((s) => s.fromOffcut), ['B1-R1', 'B1-R2']);
+// 批末库存 = 未用 S2 + 本批回收两块
+assert.deepStrictEqual(bp1.poolAfter.map((s) => s.id), ['S2', 'P1-B1-R1', 'P1-B1-R2']);
+assert.strictEqual(bp1.poolAfter[0].fromBatch, undefined, '初始库存无来源批次');
+assert.strictEqual(bp1.poolAfter[1].fromBatch, 1);
+assert.strictEqual(bp1.poolAfter[1].fromOffcut, 'B1-R1');
+// 批2：用上批回收余板 P1-B1-R2，0 张新板、累计材料费不变
+assert.strictEqual(bp2.batch, 2);
+assert.strictEqual(bp2.standardBoardsCount, 0);
+assert.strictEqual(bp2.materialCents, 0);
+assert.strictEqual(bp2.cumulativeMaterialCents, 10000);
+assert.strictEqual(bp2.poolBeforeCount, 3);
+assert.deepStrictEqual(bp2.stockUsed.map((s) => s.id), ['P1-B1-R2']);
+assert.deepStrictEqual(bp2.stockAdded, []);
+assert.deepStrictEqual(bp2.poolAfter.map((s) => s.id), ['S2', 'P1-B1-R1']);
+// 全局汇总：累计材料费 = 逐批累加；最终库存 = 末批批末库存
+assert.strictEqual(bp.totalStandardBoards, 1);
+assert.strictEqual(bp.totalMaterialCents, 10000);
+assert.deepStrictEqual(bp.finalPool.map((s) => s.id), ['S2', 'P1-B1-R1']);
+// 非首批自带的 stockBoards 不入池
+assert(!bp1.poolAfter.some((s) => s.id === 'X9'));
+assert(!bp2.poolAfter.some((s) => s.id === 'X9'));
+assert(!bp.finalPool.some((s) => s.id === 'X9'));
+
+// 43) 跨批编号不冲突：初始库存已叫 P1-B1-R1 时，回收编号自动加后缀避让
+const bpConflict = batchPreviewBoards({
+  batches: [
+    {
+      boardWidth: 1000, boardHeight: 500, kerf: 0, boardPrice: 10,
+      stockBoards: [{ id: 'P1-B1-R1', width: 100, height: 100 }], // 与生成的回收编号撞名
+      orders: [{ orderNo: 'A', parts: [{ name: '板', width: 400, height: 300, quantity: 1 }] }],
+    },
+  ],
+});
+assert.deepStrictEqual(bpConflict.batches[0].stockAdded.map((s) => s.id), ['P1-B1-R1-2', 'P1-B1-R2']);
+const bpConflictPool = bpConflict.batches[0].poolAfter.map((s) => s.id);
+assert.deepStrictEqual(bpConflictPool, ['P1-B1-R1', 'P1-B1-R1-2', 'P1-B1-R2']);
+assert.strictEqual(new Set(bpConflictPool).size, bpConflictPool.length, '余板编号全程不得重复');
+
+// 44) 跨批使用回收余板：零件大于本批标准板、但恰好能放进上批回收的余板
+const bpReuse = batchPreviewBoards({
+  batches: [
+    {
+      boardWidth: 700, boardHeight: 500, kerf: 0, boardPrice: 10,
+      orders: [{ orderNo: 'A', parts: [{ name: '板', width: 600, height: 500, quantity: 1 }] }],
+    },
+    {
+      boardWidth: 100, boardHeight: 100, kerf: 0, boardPrice: 10, // 标准板极小
+      orders: [{ orderNo: 'B', parts: [{ name: '条', width: 100, height: 500, quantity: 1 }] }],
+    },
+  ],
+});
+assert.deepStrictEqual(bpReuse.batches[0].stockAdded.map((s) => s.id), ['P1-B1-R1']);
+assert.strictEqual(bpReuse.batches[1].standardBoardsCount, 0, '应复用上批回收余板而非开新板');
+assert.deepStrictEqual(bpReuse.batches[1].stockUsed.map((s) => s.id), ['P1-B1-R1']);
+assert.strictEqual(bpReuse.batches[1].cumulativeMaterialCents, 1000);
+assert.strictEqual(bpReuse.totalMaterialCents, 1000);
+
+// 45) 某批无法加工：指出批次并停止，不提交部分结果
+assert.throws(() => batchPreviewBoards({
+  batches: [
+    {
+      boardWidth: 1200, boardHeight: 800, kerf: 0,
+      orders: [{ orderNo: 'A', parts: [{ name: '块', width: 600, height: 400, quantity: 1 }] }],
+    },
+    {
+      boardWidth: 500, boardHeight: 300, kerf: 0,
+      orders: [{ orderNo: 'B', parts: [{ name: '大', width: 900, height: 900, quantity: 1 }] }],
+    },
+  ],
+}), (e) => {
+  assert(e instanceof UserError);
+  assert(/第 2 批/.test(e.message), '错误信息应指出无法加工的批次：' + e.message);
+  return true;
+});
+// 首批初始余板库存非法同样指出批次
+assert.throws(() => batchPreviewBoards({
+  batches: [
+    {
+      boardWidth: 1000, boardHeight: 1000, kerf: 0,
+      stockBoards: [{ id: 'DUP', width: 10, height: 10 }, { id: 'DUP', width: 20, height: 20 }],
+      orders: [{ orderNo: 'A', parts: [{ name: 'a', width: 10, height: 10, quantity: 1 }] }],
+    },
+  ],
+}), (e) => {
+  assert(e instanceof UserError);
+  assert(/第 1 批/.test(e.message), '初始库存非法应指出批次：' + e.message);
+  return true;
+});
+
+// 46) 连续预演输入校验与只读性：空批次 / 非数组报错；各批输入快照不被修改
+assert.throws(() => batchPreviewBoards({}), UserError, '缺少 batches 应报错');
+assert.throws(() => batchPreviewBoards({ batches: [] }), UserError, '空批次应报错');
+assert.throws(() => batchPreviewBoards({ batches: 'x' }), UserError, '非数组批次应报错');
+const bpIn = {
+  batches: [
+    {
+      boardWidth: 1200, boardHeight: 800, kerf: 0, boardPrice: 100,
+      stockBoards: [{ id: 'S1', width: 700, height: 500 }],
+      orders: [{ orderNo: 'A', parts: [{ name: '块', width: 600, height: 400, quantity: 2 }] }],
+    },
+    {
+      boardWidth: 1200, boardHeight: 800, kerf: 0, boardPrice: 100,
+      stockBoards: [{ id: 'S9', width: 100, height: 100 }],
+      orders: [{ orderNo: 'B', parts: [{ name: '块', width: 600, height: 400, quantity: 1 }] }],
+    },
+  ],
+};
+const bpInCopy = JSON.parse(JSON.stringify(bpIn));
+batchPreviewBoards(bpIn);
+assert.deepStrictEqual(bpIn, bpInCopy, '预演不得改动各批输入快照');
 
 console.log('全部算法自检通过 ✔');

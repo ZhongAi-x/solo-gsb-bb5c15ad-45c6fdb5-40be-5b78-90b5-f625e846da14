@@ -414,6 +414,34 @@ summary { cursor: pointer; font-size: 13px; color: var(--blue); }
 .delta-neg { color: #047857; }
 .delta-zero { color: var(--muted); font-weight: 400; }
 
+/* ---- 连续批次用料预演 ---- */
+.batch-box {
+  margin-top: 18px;
+  border-top: 2px solid #a78bfa;
+  padding-top: 4px;
+}
+.batch-box .parts-head { margin-top: 8px; }
+.batch-list { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+.batch-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 8px;
+  background: #f8fafc;
+}
+.batch-item-meta { flex: 1; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.batch-section {
+  margin-top: 26px;
+  border-top: 2px solid #a78bfa;
+  padding-top: 4px;
+}
+.batch-section .alert { margin-top: 12px; }
+.batch-result { margin-top: 14px; }
+.batch-card { border-color: #a78bfa; background: #fdfcff; }
+.batch-subtitle { font-size: 14px; margin: 16px 0 6px; }
+
 .site-footer {
   margin-top: 22px;
   text-align: center;

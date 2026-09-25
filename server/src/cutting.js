@@ -53,6 +53,17 @@
  *    区域序号为该板最终空闲区域的顺序号（从 1 起），未通过筛选的区域保留序号但
  *    不进入清单，因此同一区域在不同筛选条件下编号稳定；
  *  - 清单只是对排料结果的只读提取，落位与材料费分摊不受影响。
+ *
+ * 连续批次用料预演（batchPreviewBoards）：
+ *  - 输入 { batches: [排料输入, ...] }：每批为保存时的表单快照（订单 + 板材参数），
+ *    按保存顺序逐批调用与 cutBoards 完全相同的排料规则；
+ *  - 首批快照的 stockBoards 作为初始余板池；后续各批自带的 stockBoards 不再入池，
+ *    统一从上一批留下的余板池取料；
+ *  - 每批结束后从池中扣除已用余板编号、保留未用余板，再把本批符合回收尺寸的余料
+ *    （该批 offcuts 清单）以「P批次号-原余料编号」入池供后续批次使用，
+ *    与历史编号冲突时自动追加 -2、-3… 后缀，全程编号不重复；
+ *  - 逐批输出新开标准板数、已用 / 新增余板、批末库存与累计材料费；
+ *  - 任一批无法加工时报错指出批次并停止，不返回任何批次结果；预演不改动输入快照。
  */
 
 const EPS = 1e-9;
@@ -1179,4 +1190,139 @@ function cancelPreviewBoards(input) {
   };
 }
 
-module.exports = { cutBoards, recutBoards, cancelPreviewBoards, UserError };
+/**
+ * 连续批次用料预演。
+ * 输入 { batches: [排料输入, ...] }：每批为保存时的表单快照（与 cutBoards 相同的
+ * 输入结构：订单清单 + 原板参数 + 可选单刀上限 / 余料回收尺寸 / 临时余板库存），
+ * 按保存顺序逐批调用与 cutBoards 完全相同的排料规则。
+ *
+ * 余板池流转：
+ *  - 首批快照的 stockBoards 作为初始余板池；后续各批自带的 stockBoards 不再入池，
+ *    统一从上一批留下的余板池取料；
+ *  - 每批结束后从池中扣除本批已用余板编号、保留未用余板；
+ *  - 本批符合回收尺寸的余料（该批 offcuts 清单，已按该批最小回收尺寸筛选）逐项以
+ *    「P{批次号}-{原余料编号}」入池供后续批次使用；与初始库存或已生成编号冲突时
+ *    自动追加 -2、-3… 后缀避让，全程编号不重复。
+ *
+ * 返回 { batchesCount, totalStandardBoards, totalMaterialCents, finalPool, batches }：
+ *  - batches[]：逐批汇总（新开标准板数、已用 / 新增余板、批末库存、本批与累计材料费）；
+ *  - 任一批无法加工（零件放不下、刀长超限或输入非法）时抛 UserError 并指出批次号，
+ *    不返回任何批次结果；预演为只读计算，不改动各批输入快照。
+ */
+function batchPreviewBoards(input) {
+  if (!input || typeof input !== 'object') {
+    throw new UserError('请求体格式不正确');
+  }
+  const rawBatches = input.batches;
+  if (!Array.isArray(rawBatches) || rawBatches.length === 0) {
+    throw new UserError('请至少保存一个批次再进行连续预演');
+  }
+  if (rawBatches.length > 50) {
+    throw new UserError('批次数量过多（最多 50 批）');
+  }
+
+  let pool = []; // 当前余板池 [{ id, width, height, origin }]；origin=null 表示初始库存
+  const seenIds = new Set(); // 历史全部余板编号（初始库存 + 各批回收生成），跨批不得冲突
+  const batches = [];
+  let totalStandardBoards = 0;
+  let cumulativeMaterialCents = 0;
+
+  // 余板池输出：编号、尺寸与来源（初始库存 / 第 N 批回收的余料编号）
+  const poolRows = (list) => list.map((s) => ({
+    id: s.id,
+    width: round3(s.width),
+    height: round3(s.height),
+    ...(s.origin ? { fromBatch: s.origin.batch, fromOffcut: s.origin.offcut } : {}),
+  }));
+
+  for (let bi = 0; bi < rawBatches.length; bi++) {
+    const batchNo = bi + 1;
+    const raw = rawBatches[bi];
+
+    // 首批：表单余板登记为初始库存（后续批次自带的 stockBoards 不入池）
+    if (bi === 0) {
+      let initial;
+      try {
+        initial = parseStockBoards(raw && typeof raw === 'object' ? raw.stockBoards : undefined);
+      } catch (err) {
+        if (err instanceof UserError) {
+          throw new UserError(`第 1 批的初始余板库存无效：${err.message}`);
+        }
+        throw err;
+      }
+      pool = initial.map((s) => ({ ...s, origin: null }));
+      for (const s of pool) seenIds.add(s.id);
+    }
+    const poolBeforeCount = pool.length;
+
+    // 以当前余板池作为本批库存，调用与单次排料完全相同的规则
+    let r;
+    try {
+      r = cutBoards({ ...(raw && typeof raw === 'object' ? raw : {}), stockBoards: pool });
+    } catch (err) {
+      if (err instanceof UserError) {
+        throw new UserError(`第 ${batchNo} 批无法加工：${err.message}（连续预演已停止，未提交任何批次结果）`);
+      }
+      throw err;
+    }
+
+    // 从池中扣除本批已用余板编号，未用余板原样保留
+    const usedIds = new Set(r.stockUsed.map((s) => s.id));
+    pool = pool.filter((s) => !usedIds.has(s.id));
+
+    // 本批符合回收尺寸的余料以「P批次号-原余料编号」入池，编号冲突自动避让
+    const stockAdded = [];
+    for (const oc of r.offcuts) {
+      let id = `P${batchNo}-${oc.id}`;
+      if (seenIds.has(id)) {
+        let n = 2;
+        while (seenIds.has(`${id}-${n}`)) n += 1;
+        id = `${id}-${n}`;
+      }
+      seenIds.add(id);
+      pool.push({
+        id,
+        width: oc.w,
+        height: oc.h,
+        origin: { batch: batchNo, offcut: oc.id },
+      });
+      stockAdded.push({
+        id,
+        fromOffcut: oc.id,
+        fromBoard: oc.board,
+        width: oc.w,
+        height: oc.h,
+      });
+    }
+
+    totalStandardBoards += r.standardBoardsCount;
+    cumulativeMaterialCents += r.totalMaterialCents;
+
+    batches.push({
+      batch: batchNo,
+      boardWidth: r.boardWidth,
+      boardHeight: r.boardHeight,
+      boardPrice: r.boardPrice,
+      ordersCount: r.orders.length,
+      totalParts: r.totalParts,
+      boardsCount: r.boardsCount,
+      standardBoardsCount: r.standardBoardsCount,
+      materialCents: r.totalMaterialCents,
+      cumulativeMaterialCents,
+      poolBeforeCount,
+      stockUsed: r.stockUsed,
+      stockAdded,
+      poolAfter: poolRows(pool),
+    });
+  }
+
+  return {
+    batchesCount: rawBatches.length,
+    totalStandardBoards,
+    totalMaterialCents: cumulativeMaterialCents,
+    finalPool: poolRows(pool),
+    batches,
+  };
+}
+
+module.exports = { cutBoards, recutBoards, cancelPreviewBoards, batchPreviewBoards, UserError };

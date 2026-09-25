@@ -15,6 +15,12 @@
 提取实际可取走的余料（已扣除零件占位与锯缝，区域互不重叠），按可配置的
 最小长度 / 最小宽度筛选，展示来源板号、坐标、尺寸与面积；勾选清单项可
 **一键追加到表单的临时余板库存**用于下一次排料，编号自动避让、不重复追加。
+需要连续评估多批生产时，还可把当前表单**依次保存为多批**（订单与板材参数快照，
+保存后修改表单不影响已保存批次）做**连续批次用料预演**：首批的表单余板作为初始库存，
+按保存顺序逐批调用同一套排料规则——每批从余板池扣除已用编号、保留未用余板，
+再把本批符合回收尺寸的余料以「批次号 + 原余料编号」入池供后续批次使用
+（跨批编号不冲突）；逐批给出新开标准板数、已用与新增余板、批末库存与累计材料费，
+某批无法加工时指出批次并停止，不提交部分结果；预演不改动表单与单次排料结果。
 
 - 前端：React 18 + Vite
 - 后端：Node.js + Express（排料 / 分摊 / 补切算法见 `server/src/cutting.js`）
@@ -49,11 +55,12 @@ docker compose up -d --build
 
 | 用途 | 地址 |
 | --- | --- |
-| Web 页面（原板参数 / 临时余板库存 / 逐板图 / 分单取件 / 可回收余料清单 / 缺件补切 / 撤单预览） | http://localhost:8080 |
+| Web 页面（原板参数 / 临时余板库存 / 逐板图 / 分单取件 / 可回收余料清单 / 缺件补切 / 撤单预览 / 连续批次预演） | http://localhost:8080 |
 | 健康检查 | http://localhost:8080/api/health |
 | 排料计算 API（含余板库存 `stockBoards` 与可回收余料清单 `offcuts`） | `POST http://localhost:8080/api/cut` |
 | 缺件补切 API（补切只开标准新板，不耗用余板） | `POST http://localhost:8080/api/recut` |
 | 撤单影响预览 API（按输入快照对比撤单前后，原方案不变） | `POST http://localhost:8080/api/cancel-preview` |
+| 连续批次用料预演 API（余板池跨批流转，逐批汇总） | `POST http://localhost:8080/api/batch-preview` |
 
 本地开发模式下前端为 http://localhost:5173 （`/api` 已配置代理到 8080）。
 
@@ -160,6 +167,19 @@ npm test
    **临时余板库存**表单（行内标记"新追加"），**下一次生成方案时自动参与排料**；
    编号与现有余板重复时自动追加 `-2`、`-3`… 后缀避让，**同一方案重复操作不会
    重复追加**；当前方案的落位与材料费分摊保持不变。
+9. **连续批次用料预演**：在左侧表单底部点击「保存当前表单为第 N 批」，把当前
+   **订单清单与板材参数**（含临时余板库存）快照保存为一个批次，可依次保存多批
+   （保存后修改表单不影响已保存批次；可单独删除某批或一键清空）。点击
+   「开始连续预演」后按**保存顺序**逐批排料：
+   - **首批的表单余板作为初始库存**，之后各批统一从上一批留下的余板池取料
+     （各批保存时表单里的余板不再单独入池）；
+   - 每批从余板池**扣除已用编号、保留未用余板**，再把本批**符合回收尺寸**的余料
+     以 **`P批次号-原余料编号`** 入池供后续批次使用（与历史编号冲突时自动加后缀
+     避让，**跨批编号不冲突**）；
+   - 逐批展示**新开标准板数、已用与新增余板、批末库存与累计材料费**
+     （材料费只计新开标准板，逐批累加）；
+   - 某批无法加工时**指出批次并停止预演，不提交部分结果**；
+   - 预演为只读评估：**不改动表单与单次排料结果**。
 
 ## 切割规则
 
@@ -268,6 +288,26 @@ npm test
     **材料费总额**（只计新增标准板）；
   - 每张**保留订单**的分摊额（前 / 后）与**增减差值**，费用差值一律按**整数分**计算；
   - 被撤订单的撤单前分摊额。
+
+## 连续批次用料预演规则
+
+- 每个批次是保存时表单的完整快照（订单清单、原板参数、锯缝、板价、单刀上限、
+  余料回收尺寸与临时余板库存）；**保存后修改表单不影响已保存批次**。
+- **首批**快照中的临时余板库存作为整个预演的**初始余板池**；后续各批快照自带的
+  余板库存不再入池，统一从上一批留下的余板池按输入顺序取料。
+- 按批次保存顺序逐批调用与 `/api/cut` 完全相同的排料规则（含锯缝、旋转、
+  单刀上限与该批的余料回收尺寸筛选）。
+- 每批结束后更新余板池：
+  - 从池中**扣除本批已用余板编号**，未用余板原样保留；
+  - 本批**符合回收尺寸的余料**（即该批 `offcuts` 清单）逐项以
+    **`P{批次号}-{原余料编号}`** 入池（如第 1 批的 `B2-R3` → `P1-B2-R3`），
+    供后续批次使用；与初始库存或已生成编号冲突时自动追加 `-2`、`-3`… 后缀，
+    **全程编号不重复**。
+- 逐批输出：新开标准板数、已用余板（含所在板号）、新增入池余板（含来源余料编号）、
+  批末库存（区分初始库存与各批回收）与累计材料费（只计新开标准板，逐批累加）。
+- 任一批次无法加工（零件放不下、刀长超限或输入非法）时，报错**指出批次号**并
+  停止预演，**不返回任何批次结果**；预演为只读计算，不改动各批输入快照，
+  也不改动表单与单次排料结果。
 
 ## 材料费分摊规则
 
@@ -557,6 +597,97 @@ npm test
   新增启用（`stockUsedAdded`）/ 不再使用（`stockUsedRemoved`）的余板编号。
 - 只有一张订单、`cancelOrder` 缺失或不在方案中、输入非法时返回 HTTP 400 与
   `{ "ok": false, "error": "..." }`。
+
+`POST /api/batch-preview`（连续批次用料预演）
+
+请求体：`{ "batches": [排料输入, ...] }`，每个批次为与 `/api/cut` 相同的输入快照
+（`boardWidth` / `boardHeight` / `kerf` / `boardPrice` / `orders`，可选
+`maxCutLength` / `minOffcutLength` / `minOffcutWidth` / `stockBoards`），
+按保存顺序排列，最多 50 批。**首批的 `stockBoards` 作为初始余板池**，
+后续批次自带的 `stockBoards` 不入池，统一从上一批留下的余板池取料。
+
+```json
+{
+  "batches": [
+    {
+      "boardWidth": 2440,
+      "boardHeight": 1220,
+      "kerf": 3,
+      "boardPrice": 180.00,
+      "minOffcutLength": 200,
+      "minOffcutWidth": 150,
+      "stockBoards": [{ "id": "YB-01", "width": 1200, "height": 800 }],
+      "orders": [
+        { "orderNo": "SO-1001", "parts": [{ "name": "柜门", "width": 600, "height": 400, "quantity": 8 }] }
+      ]
+    },
+    {
+      "boardWidth": 2440,
+      "boardHeight": 1220,
+      "kerf": 3,
+      "boardPrice": 180.00,
+      "minOffcutLength": 200,
+      "minOffcutWidth": 150,
+      "orders": [
+        { "orderNo": "SO-1002", "parts": [{ "name": "层板", "width": 700, "height": 300, "quantity": 4 }] }
+      ]
+    }
+  ]
+}
+```
+
+返回（节选，数值仅为示意）：
+
+```json
+{
+  "ok": true,
+  "result": {
+    "batchesCount": 2,
+    "totalStandardBoards": 3,
+    "totalMaterialCents": 54000,
+    "finalPool": [
+      { "id": "P1-B2-R3", "width": 600, "height": 397, "fromBatch": 1, "fromOffcut": "B2-R3" }
+    ],
+    "batches": [
+      {
+        "batch": 1,
+        "boardWidth": 2440,
+        "boardHeight": 1220,
+        "boardPrice": 180,
+        "ordersCount": 1,
+        "totalParts": 8,
+        "boardsCount": 2,
+        "standardBoardsCount": 2,
+        "materialCents": 36000,
+        "cumulativeMaterialCents": 36000,
+        "poolBeforeCount": 1,
+        "stockUsed": [
+          { "id": "YB-01", "inputIndex": 1, "board": 1, "width": 1200, "height": 800 }
+        ],
+        "stockAdded": [
+          { "id": "P1-B2-R3", "fromOffcut": "B2-R3", "fromBoard": 2, "width": 600, "height": 397 }
+        ],
+        "poolAfter": [
+          { "id": "P1-B2-R3", "width": 600, "height": 397, "fromBatch": 1, "fromOffcut": "B2-R3" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+- `batches[]`：逐批汇总（按保存顺序）。`standardBoardsCount` 为本批新开标准板数；
+  `materialCents` / `cumulativeMaterialCents` 为本批材料费与逐批累计材料费（整数分，
+  只计新开标准板）；`poolBeforeCount` 为批初库存块数。
+- `stockUsed[]`：本批从余板池扣除的已用余板（编号、池内序号、所在板号与尺寸）；
+  `stockAdded[]`：本批符合回收尺寸、以 `P{批次号}-{原余料编号}` 入池的余料
+  （含来源余料编号 `fromOffcut` 与来源板号 `fromBoard`），供后续批次使用。
+- `poolAfter[]`：批末库存（未用余板 + 本批新入池余料），初始库存不带 `fromBatch`，
+  回收余板带 `fromBatch` / `fromOffcut` 标明来源批次与余料编号；全程编号不重复。
+- `totalStandardBoards` / `totalMaterialCents`：全部批次的新开标准板总数与累计材料费；
+  `finalPool`：全部批次结束后的最终余板库存。
+- 任一批次无法加工时返回 HTTP 400 与 `{ "ok": false, "error": "第 N 批无法加工：…" }`，
+  不返回任何批次结果；`batches` 缺失 / 为空 / 非数组时同样返回 HTTP 400。
 
 ## 目录结构
 
